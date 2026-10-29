@@ -1,0 +1,305 @@
+name: Release patched cua-driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/release.yml
+      - upstream.json
+      - patches/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CUA_TELEMETRY: "0"
+  DO_NOT_TRACK: "1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: linux-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    container: debian:11
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+    steps:
+      - name: Install toolchain packages
+        run: |
+          cat > /etc/apt/sources.list <<'EOF'
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian/20260901T000000Z/ bullseye-updates main
+          deb [check-valid-until=no signed-by=/usr/share/keyrings/debian-archive-keyring.gpg] http://snapshot.debian.org/archive/debian-security/20260901T000000Z/ bullseye-security main
+          EOF
+          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 update
+          apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 install -y --no-install-recommends \
+            git ca-certificates curl python3 patch build-essential pkg-config \
+            libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev \
+            libxkbcommon-dev
+
+      - uses: actions/checkout@v4
+
+      - name: Read pin
+        id: pin
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          pin = json.load(open("upstream.json"))
+          print(f"repository={pin['upstream']['repository']}")
+          print(f"commit={pin['upstream']['commit']}")
+          print(f"release={pin['release']}")
+          print(f"patch={pin['patch']}")
+          PY
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pin.outputs.repository }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Apply patch
+        run: patch -p1 -d upstream < "${{ steps.pin.outputs.patch }}"
+
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        working-directory: upstream/libs/cua-driver/rust
+        run: cargo build --locked -p cua-driver --release --features cua-driver/portal-input --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          STAGE="cua-driver-${{ steps.pin.outputs.release }}-linux-${{ matrix.arch }}"
+          BIN="upstream/libs/cua-driver/rust/target/${{ matrix.target }}/release/cua-driver"
+          mkdir -p "dist/$STAGE"
+          cp "$BIN" "dist/$STAGE/cua-driver"
+          tar -czf "dist/${STAGE}.tar.gz" -C "dist/$STAGE" cua-driver
+          hash=$(sha256sum "dist/${STAGE}.tar.gz" | awk '{print $1}')
+          printf '%s  %s\n' "$hash" "${STAGE}.tar.gz" > "dist/${STAGE}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: windows-${{ matrix.arch }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            target: x86_64-pc-windows-msvc
+          - arch: aarch64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pin
+        id: pin
+        shell: bash
+        run: |
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          pin = json.load(open("upstream.json"))
+          print(f"repository={pin['upstream']['repository']}")
+          print(f"commit={pin['upstream']['commit']}")
+          print(f"release={pin['release']}")
+          print(f"patch={pin['patch']}")
+          PY
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pin.outputs.repository }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Apply patch
+        shell: bash
+        run: patch -p1 -d upstream < "${{ steps.pin.outputs.patch }}"
+
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Ensure rustc target
+        shell: bash
+        run: |
+          rustup target add "${{ matrix.target }}"
+          rustup target list --installed | grep -Fx "${{ matrix.target }}"
+
+      - name: Build
+        working-directory: upstream/libs/cua-driver/rust
+        shell: bash
+        run: cargo build --locked -p cua-driver -p cua-driver-uia --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $stage = "cua-driver-${{ steps.pin.outputs.release }}-windows-${{ matrix.arch }}"
+          $bin = "upstream/libs/cua-driver/rust/target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force -Path "dist/$stage" | Out-Null
+          Copy-Item "$bin/cua-driver.exe" "dist/$stage/cua-driver.exe"
+          Copy-Item "$bin/cua-driver-uia.exe" "dist/$stage/cua-driver-uia.exe"
+          Compress-Archive -Path "dist/$stage/*" -DestinationPath "dist/$stage.zip" -Force
+          $hash = (Get-FileHash "dist/$stage.zip" -Algorithm SHA256).Hash.ToLower()
+          [System.IO.File]::WriteAllText("$pwd/dist/$stage.zip.sha256", "$hash  $stage.zip`n")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+
+  build-darwin:
+    name: darwin
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pin
+        id: pin
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          pin = json.load(open("upstream.json"))
+          print(f"repository={pin['upstream']['repository']}")
+          print(f"commit={pin['upstream']['commit']}")
+          print(f"release={pin['release']}")
+          print(f"patch={pin['patch']}")
+          PY
+
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ steps.pin.outputs.repository }}
+          ref: ${{ steps.pin.outputs.commit }}
+          path: upstream
+          fetch-depth: 1
+
+      - name: Apply patch
+        run: patch -p1 -d upstream < "${{ steps.pin.outputs.patch }}"
+
+      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Build arm64
+        working-directory: upstream/libs/cua-driver/rust
+        run: cargo build --locked -p cua-driver --release --target aarch64-apple-darwin
+
+      - name: Build x64
+        working-directory: upstream/libs/cua-driver/rust
+        run: cargo build --locked -p cua-driver --release --target x86_64-apple-darwin
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          ROOT="upstream/libs/cua-driver/rust/target"
+          package() {
+            local label="$1" target="$2"
+            local stage="cua-driver-${{ steps.pin.outputs.release }}-${label}"
+            mkdir -p "dist/$stage"
+            cp "$ROOT/$target/release/cua-driver" "dist/$stage/cua-driver"
+            tar -czf "dist/${stage}.tar.gz" -C "dist/$stage" cua-driver
+            hash=$(shasum -a 256 "dist/${stage}.tar.gz" | awk '{print $1}')
+            printf '%s  %s\n' "$hash" "${stage}.tar.gz" > "dist/${stage}.tar.gz.sha256"
+          }
+          package darwin-arm64 aarch64-apple-darwin
+          package darwin-x64 x86_64-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: darwin
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [build-linux, build-windows, build-darwin]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read pin
+        id: pin
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          pin = json.load(open("upstream.json"))
+          print(f"tag=v{pin['release']}")
+          print(f"upstream_tag={pin['upstream']['tag']}")
+          print(f"commit={pin['upstream']['commit']}")
+          print(f"release={pin['release']}")
+          PY
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Write checksums and notes
+        run: |
+          set -euo pipefail
+          cd dist
+          : > SHA256SUMS
+          for sum in *.sha256; do
+            cat "$sum" >> SHA256SUMS
+            echo >> SHA256SUMS
+          done
+          {
+            echo "Patched build of trycua/cua \`${{ steps.pin.outputs.upstream_tag }}\` (\`${{ steps.pin.outputs.commit }}\`)."
+            echo
+            echo "Patch: \`patches/capture-id.patch\` writes capture_id, snapshot_id, and visual-region bounds into MCP text."
+            echo
+            echo "Linux binaries are linked on Debian 11 (glibc 2.31) with \`cua-driver/portal-input\`. macOS and Windows binaries are unsigned."
+            echo
+            echo '```'
+            cat SHA256SUMS
+            echo '```'
+          } > ../notes.md
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pin.outputs.tag }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip dist/SHA256SUMS)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG" "${assets[@]}" \
+              --title "cua-driver ${{ steps.pin.outputs.release }}" \
+              --notes-file notes.md
+          fi

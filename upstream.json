@@ -1,0 +1,9 @@
+{
+  "upstream": {
+    "repository": "trycua/cua",
+    "tag": "cua-driver-rs-v0.34.1",
+    "commit": "0c69d9a2c8abbb5051a2df4a23f0fa166d5385dc"
+  },
+  "release": "0.34.1-munk.1",
+  "patch": "patches/capture-id.patch"
+}

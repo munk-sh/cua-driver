@@ -1,0 +1,256 @@
+diff --git a/libs/cua-driver/rust/crates/cua-driver-core/src/perception_tools.rs b/libs/cua-driver/rust/crates/cua-driver-core/src/perception_tools.rs
+index d8e6b0b..6cd0d7d 100644
+--- a/libs/cua-driver/rust/crates/cua-driver-core/src/perception_tools.rs
++++ b/libs/cua-driver/rust/crates/cua-driver-core/src/perception_tools.rs
+@@ -156,11 +156,40 @@ impl Tool for ParseVisualRegionsTool {
+             Err(error) => return tool_error(error),
+         };
+         let structured = serde_json::to_value(&output).expect("visual output serializes");
+-        ToolResult::text(format!("Parsed {} visual regions", output.regions.len()))
+-            .with_structured(structured)
++        ToolResult::text(format_visual_regions_text(&output)).with_structured(structured)
+     }
+ }
+ 
++fn format_visual_regions_text(output: &ParseVisualRegionsOutput) -> String {
++    let mut lines = vec![format!(
++        "Parsed {} visual regions capture_id={}",
++        output.regions.len(),
++        output.capture.capture_id
++    )];
++    for region in &output.regions {
++        let kind = match region.kind {
++            VisualRegionKind::Text => "text",
++            VisualRegionKind::Icon => "icon",
++        };
++        let b = &region.bounds;
++        let (cx, cy) = b.center();
++        let mut line = format!(
++            "id={} kind={} bounds={},{},{},{} center={},{} confidence={:.3}",
++            region.id, kind, b.x, b.y, b.width, b.height, cx, cy, region.confidence
++        );
++        if let Some(text) = region.text.as_deref().filter(|s| !s.is_empty()) {
++            let escaped = serde_json::to_string(text).unwrap_or_else(|_| format!("{text:?}"));
++            line.push_str(&format!(" text={escaped}"));
++        }
++        if let Some(label) = region.label.as_deref().filter(|s| !s.is_empty()) {
++            let escaped = serde_json::to_string(label).unwrap_or_else(|_| format!("{label:?}"));
++            line.push_str(&format!(" label={escaped}"));
++        }
++        lines.push(line);
++    }
++    lines.join("\n")
++}
++
+ #[derive(Deserialize)]
+ struct WorkerRegion {
+     id: String,
+diff --git a/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs b/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
+index 35671e3..549198f 100644
+--- a/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
++++ b/libs/cua-driver/rust/crates/platform-macos/src/tools/get_window_state.rs
+@@ -24,6 +24,36 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+ /// call may still be waiting on its messaging timeout.
+ const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+ 
++/// `snapshot_id` and `capture_id` are registered after the summary line is
++/// built. Clients that keep only text content never see `structuredContent`,
++/// so both ids are appended to that line when present.
++fn append_observation_ids(
++    content: &mut [Content],
++    snapshot_id: Option<&str>,
++    capture_id: Option<&str>,
++) {
++    let mut extra = String::new();
++    if let Some(sid) = snapshot_id.filter(|sid| !sid.is_empty()) {
++        extra.push_str(&format!(" snapshot_id={sid}"));
++    }
++    if let Some(cid) = capture_id.filter(|cid| !cid.is_empty()) {
++        extra.push_str(&format!(" capture_id={cid}"));
++    }
++    if extra.is_empty() {
++        return;
++    }
++    let Some(Content::Text { text, .. }) = content
++        .iter_mut()
++        .find(|part| matches!(part, Content::Text { .. }))
++    else {
++        return;
++    };
++    match text.find('\n') {
++        Some(index) => text.insert_str(index, &extra),
++        None => text.push_str(&extra),
++    }
++}
++
+ fn def() -> &'static ToolDef {
+     DEF.get_or_init(|| ToolDef {
+         name: "get_window_state".into(),
+@@ -649,6 +679,11 @@ impl Tool for GetWindowStateTool {
+         if let Some(capture_id) = capture_id {
+             structured["capture_id"] = serde_json::json!(capture_id);
+         }
++        append_observation_ids(
++            &mut content,
++            structured.get("snapshot_id").and_then(Value::as_str),
++            structured.get("capture_id").and_then(Value::as_str),
++        );
+         // Best-effort-background ladder, rung (2). Both rungs point the agent at
+         // the same next move: an empty AX tree means element_index has nothing
+         // to bind to, so the deliberate action is an element px action — read
+
+diff --git a/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs b/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+index 1417e42..f653fcf 100644
+--- a/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/tools/impl_.rs
+@@ -19,6 +19,59 @@ use std::sync::{Arc, RwLock};
+ use crate::atspi::Snapshots;
+ use cursor_overlay::CursorRegistry;
+ 
++/// `snapshot_id` and `capture_id` are registered after the summary line is
++/// built. Clients that keep only text content never see `structuredContent`,
++/// so both ids are appended to the first text line when present. An image-only
++/// response gets a one-line summary inserted at the front.
++fn append_observation_ids(
++    content: &mut Vec<cua_driver_core::protocol::Content>,
++    snapshot_id: Option<&str>,
++    capture_id: Option<&str>,
++    fallback_header: &str,
++) {
++    let mut extra = String::new();
++    if let Some(sid) = snapshot_id.filter(|sid| !sid.is_empty()) {
++        extra.push_str(&format!(" snapshot_id={sid}"));
++    }
++    if let Some(cid) = capture_id.filter(|cid| !cid.is_empty()) {
++        extra.push_str(&format!(" capture_id={cid}"));
++    }
++    if extra.is_empty() {
++        return;
++    }
++    if let Some(cua_driver_core::protocol::Content::Text { text, .. }) = content
++        .iter_mut()
++        .find(|part| matches!(part, cua_driver_core::protocol::Content::Text { .. }))
++    {
++        match text.find('\n') {
++            Some(index) => text.insert_str(index, &extra),
++            None => text.push_str(&extra),
++        }
++        return;
++    }
++    if content.is_empty() {
++        return;
++    }
++    let mut line = fallback_header.trim_end().to_string();
++    if line.is_empty() {
++        return;
++    }
++    line.push_str(&extra);
++    content.insert(0, cua_driver_core::protocol::Content::text(line));
++}
++
++fn observation_fallback_header(window_id: u64, pid: u32, structured: &Value) -> String {
++    match (
++        structured.get("screenshot_width").and_then(Value::as_u64),
++        structured.get("screenshot_height").and_then(Value::as_u64),
++    ) {
++        (Some(width), Some(height)) => {
++            format!("window_id={window_id} pid={pid} size={width}x{height}")
++        }
++        _ => format!("window_id={window_id} pid={pid}"),
++    }
++}
++
+ fn window_target_candidates_for_pid(
+     windows: impl IntoIterator<Item = crate::x11::WindowInfo>,
+     pid: u32,
+@@ -1759,6 +1812,12 @@ impl Tool for GetWindowStateTool {
+                 if display_only {
+                     cua_driver_core::display_only::mark_display_only(&mut structured);
+                 }
++                append_observation_ids(
++                    &mut content,
++                    structured.get("snapshot_id").and_then(Value::as_str),
++                    structured.get("capture_id").and_then(Value::as_str),
++                    &observation_fallback_header(xid, pid, &structured),
++                );
+ 
+                 // The capture-only path (include_accessibility_tree:false) leaves
+                 // `content` empty when the screenshot was also unavailable — most
+diff --git a/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs b/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs
+index 54e58a7..6fb84e2 100644
+--- a/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs
++++ b/libs/cua-driver/rust/crates/platform-windows/src/tools/impl_.rs
+@@ -410,6 +410,60 @@ use std::sync::{Arc, RwLock};
+ 
+ use crate::uia::Snapshots;
+ use cursor_overlay::CursorRegistry;
++
++/// `snapshot_id` and `capture_id` are registered after the summary line is
++/// built. Clients that keep only text content never see `structuredContent`,
++/// so both ids are appended to the first text line when present. An image-only
++/// response gets a one-line summary inserted at the front.
++fn append_observation_ids(
++    content: &mut Vec<cua_driver_core::protocol::Content>,
++    snapshot_id: Option<&str>,
++    capture_id: Option<&str>,
++    fallback_header: &str,
++) {
++    let mut extra = String::new();
++    if let Some(sid) = snapshot_id.filter(|sid| !sid.is_empty()) {
++        extra.push_str(&format!(" snapshot_id={sid}"));
++    }
++    if let Some(cid) = capture_id.filter(|cid| !cid.is_empty()) {
++        extra.push_str(&format!(" capture_id={cid}"));
++    }
++    if extra.is_empty() {
++        return;
++    }
++    if let Some(cua_driver_core::protocol::Content::Text { text, .. }) = content
++        .iter_mut()
++        .find(|part| matches!(part, cua_driver_core::protocol::Content::Text { .. }))
++    {
++        match text.find('\n') {
++            Some(index) => text.insert_str(index, &extra),
++            None => text.push_str(&extra),
++        }
++        return;
++    }
++    if content.is_empty() {
++        return;
++    }
++    let mut line = fallback_header.trim_end().to_string();
++    if line.is_empty() {
++        return;
++    }
++    line.push_str(&extra);
++    content.insert(0, cua_driver_core::protocol::Content::text(line));
++}
++
++fn observation_fallback_header(window_id: u64, pid: u32, structured: &Value) -> String {
++    match (
++        structured.get("screenshot_width").and_then(Value::as_u64),
++        structured.get("screenshot_height").and_then(Value::as_u64),
++    ) {
++        (Some(width), Some(height)) => {
++            format!("window_id={window_id} pid={pid} size={width}x{height}")
++        }
++        _ => format!("window_id={window_id} pid={pid}"),
++    }
++}
++
+ use windows::core::Interface as _;
+ 
+ fn window_target_candidates_for_pid(
+@@ -1745,6 +1799,12 @@ impl Tool for GetWindowStateTool {
+                 if display_only {
+                     cua_driver_core::display_only::mark_display_only(&mut structured);
+                 }
++                append_observation_ids(
++                    &mut content,
++                    structured.get("snapshot_id").and_then(Value::as_str),
++                    structured.get("capture_id").and_then(Value::as_str),
++                    &observation_fallback_header(hwnd, pid, &structured),
++                );
+ 
+                 // The capture-only path (include_accessibility_tree:false) leaves
+                 // `content` empty if the screenshot was also unavailable. Return a
