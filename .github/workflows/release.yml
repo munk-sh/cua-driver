@@ -46,7 +46,7 @@ jobs:
           EOF
           apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 update
           apt-get -o Dir::Etc::sourceparts=- -o Acquire::Retries=5 install -y --no-install-recommends \
-            git ca-certificates curl python3 patch build-essential pkg-config \
+            bash git ca-certificates curl python3 patch build-essential pkg-config \
             libx11-dev libxi-dev libxtst-dev libxext-dev libwayland-dev \
             libxkbcommon-dev
 
@@ -84,6 +84,7 @@ jobs:
         run: cargo build --locked -p cua-driver --release --features cua-driver/portal-input --target ${{ matrix.target }}
 
       - name: Package
+        shell: bash
         run: |
           set -euo pipefail
           STAGE="cua-driver-${{ steps.pin.outputs.release }}-linux-${{ matrix.arch }}"
